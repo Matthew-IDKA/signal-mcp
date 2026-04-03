@@ -1,0 +1,25 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# MCP config (contains local env vars)
+.mcp.json
+mcp-config.json

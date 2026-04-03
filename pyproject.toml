@@ -1,0 +1,34 @@
+[project]
+name = "signal-mcp"
+version = "0.1.0"
+description = "MCP server bridging Claude Code to Signal via signal-cli-rest-api"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26.0,<2.0",
+    "httpx>=0.28.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.22",
+]
+
+[project.scripts]
+signal-mcp = "signal_mcp.server:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["signal_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
