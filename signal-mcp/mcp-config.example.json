@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "signal-mcp": {
+      "command": "signal-mcp",
+      "args": [],
+      "env": {
+        "SIGNAL_API_URL": "http://localhost:8093",
+        "SIGNAL_BOT_NUMBER": "+15551234567",
+        "SIGNAL_CHANNEL_TYPE": "dm",
+        "SIGNAL_CHANNEL_ID": "+15559876543"
+      }
+    }
+  }
+}
