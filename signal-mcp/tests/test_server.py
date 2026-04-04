@@ -1,5 +1,6 @@
 """Tests for the Signal MCP server."""
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,12 +118,15 @@ class TestReplyTool:
         assert "123456" in result
 
     @respx.mock
-    async def test_reply_http_error(self, dm_env):
+    async def test_reply_http_error_sanitized(self, dm_env):
+        """HTTPStatusError message must not contain the request URL (which has bot number)."""
         respx.post("http://signal-test:8093/v2/send").mock(
             return_value=httpx.Response(500, text="Internal Server Error")
         )
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await server.reply("will fail")
+        assert "+15550001234" not in str(exc_info.value)
+        assert "HTTP 500" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -172,6 +176,81 @@ class TestSendAttachment:
             result = await server.send_attachment(str(test_file))
             assert "Error" in result
             assert "95 MB" in result
+
+
+@pytest.mark.asyncio
+class TestDownloadAttachment:
+    @respx.mock
+    async def test_happy_path(self, dm_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(server, "ATTACHMENT_DIR", tmp_path / "attachments")
+        respx.get("http://signal-test:8093/v1/attachments/abc123.jpg").mock(
+            return_value=httpx.Response(200, content=b"fake-image-data")
+        )
+        result = await server.download_attachment("abc123.jpg")
+        assert "abc123.jpg" in result
+        assert "15" in result  # byte count
+
+    @respx.mock
+    async def test_invalid_id_format(self, dm_env):
+        result = await server.download_attachment("../../etc/passwd")
+        assert "Error" in result
+        assert "invalid" in result
+
+    @respx.mock
+    async def test_invalid_id_with_slash(self, dm_env):
+        result = await server.download_attachment("foo/bar")
+        assert "Error" in result
+        assert "invalid" in result
+
+    @respx.mock
+    async def test_path_traversal_blocked(self, dm_env, tmp_path, monkeypatch):
+        safe_dir = tmp_path / "attachments"
+        monkeypatch.setattr(server, "ATTACHMENT_DIR", safe_dir)
+        safe_dir.mkdir()
+        respx.get("http://signal-test:8093/v1/attachments/abc123.jpg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+        # Attempt to write outside the attachment dir
+        evil_path = str(tmp_path / "evil.txt")
+        result = await server.download_attachment("abc123.jpg", save_path=evil_path)
+        assert "Error" in result
+        assert "save_path" in result
+        assert not (tmp_path / "evil.txt").exists()
+
+    @respx.mock
+    async def test_custom_save_path_within_allowed_dir(self, dm_env, tmp_path, monkeypatch):
+        safe_dir = tmp_path / "attachments"
+        monkeypatch.setattr(server, "ATTACHMENT_DIR", safe_dir)
+        safe_dir.mkdir()
+        respx.get("http://signal-test:8093/v1/attachments/abc123.jpg").mock(
+            return_value=httpx.Response(200, content=b"image-bytes")
+        )
+        save_to = str(safe_dir / "abc123.jpg")
+        result = await server.download_attachment("abc123.jpg", save_path=save_to)
+        assert "abc123.jpg" in result
+        assert (safe_dir / "abc123.jpg").read_bytes() == b"image-bytes"
+
+    @respx.mock
+    async def test_api_error_sanitized(self, dm_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(server, "ATTACHMENT_DIR", tmp_path / "attachments")
+        respx.get("http://signal-test:8093/v1/attachments/abc123.jpg").mock(
+            return_value=httpx.Response(404)
+        )
+        result = await server.download_attachment("abc123.jpg")
+        assert "Error" in result
+        assert "404" in result
+        # Bot number must not appear in the error
+        assert "+15550001234" not in result
+
+    @respx.mock
+    async def test_timeout_returns_clean_error(self, dm_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(server, "ATTACHMENT_DIR", tmp_path / "attachments")
+        respx.get("http://signal-test:8093/v1/attachments/abc123.jpg").mock(
+            side_effect=httpx.TimeoutException("timed out")
+        )
+        result = await server.download_attachment("abc123.jpg")
+        assert "Error" in result
+        assert "timed out" in result
 
 
 @pytest.mark.asyncio
@@ -242,6 +321,52 @@ class TestGetContacts:
         )
         result = await server.get_contacts()
         assert "No contacts" in result
+
+
+# ---------------------------------------------------------------------------
+# PII redaction tests
+# ---------------------------------------------------------------------------
+
+class TestPiiRedaction:
+    def test_redact_pii_replaces_phone_number(self):
+        result = server._redact_pii("Message from +14152739647")
+        assert "+14152739647" not in result
+        assert "[pii:" in result
+
+    def test_redact_pii_preserves_non_pii(self):
+        text = "No phone numbers here, just regular text."
+        assert server._redact_pii(text) == text
+
+    def test_redact_pii_consistent_hashing(self):
+        """Same number must produce the same token (enables log correlation)."""
+        r1 = server._redact_pii("+14152739647")
+        r2 = server._redact_pii("+14152739647")
+        assert r1 == r2
+
+    def test_redact_pii_different_numbers_differ(self):
+        r1 = server._redact_pii("+14152739647")
+        r2 = server._redact_pii("+14155967114")
+        assert r1 != r2
+
+    def test_redact_pii_multiple_numbers_in_one_string(self):
+        text = "From +14152739647 to +14155967114"
+        result = server._redact_pii(text)
+        assert "+14152739647" not in result
+        assert "+14155967114" not in result
+        assert result.count("[pii:") == 2
+
+    def test_pii_filter_applied_to_log_record(self):
+        """_PiiFilter must redact phone numbers before the record is written."""
+        f = server._PiiFilter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="Received from %s", args=("+14152739647",), exc_info=None
+        )
+        f.filter(record)
+        assert "+14152739647" not in record.getMessage()
+        assert "[pii:" in record.getMessage()
+        # args must be cleared so the formatter doesn't re-apply them
+        assert record.args == ()
 
 
 # ---------------------------------------------------------------------------

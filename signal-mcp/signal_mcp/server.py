@@ -7,6 +7,7 @@ outbound communication.
 """
 
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -24,21 +25,59 @@ from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Logging -- dual output: stderr (captured by Claude Code) + file (persistent)
+#
+# PII policy: E.164 phone numbers are replaced with a short SHA-256 hash
+# ([pii:XXXXXXXX]) before any log record is written. The hash is stable, so
+# the same number produces the same token across log lines (useful for
+# correlating events) without exposing the number itself.
+#
+# Log directory: defaults to the system temp dir. Set SIGNAL_LOG_DIR to
+# redirect logs to a user-owned directory (recommended for multi-user hosts).
 # ---------------------------------------------------------------------------
 
-LOG_PATH = Path(tempfile.gettempdir()) / "signal-mcp.log"
+_PII_PHONE_RE = re.compile(r'\+\d{7,15}')
+
+
+def _redact_pii(text: str) -> str:
+    """Replace E.164 phone numbers with a short non-reversible hash."""
+    def _hash(m: re.Match) -> str:
+        h = hashlib.sha256(m.group().encode()).hexdigest()[:8]
+        return f"[pii:{h}]"
+    return _PII_PHONE_RE.sub(_hash, text)
+
+
+class _PiiFilter(logging.Filter):
+    """Redact phone numbers from log records before writing."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        redacted = _redact_pii(msg)
+        if redacted != msg:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+_log_dir = Path(os.environ.get("SIGNAL_LOG_DIR", tempfile.gettempdir()))
+LOG_PATH = _log_dir / "signal-mcp.log"
 
 log = logging.getLogger("signal-mcp")
 log.setLevel(logging.DEBUG)
 
+_pii_filter = _PiiFilter()
+
 _stderr_handler = logging.StreamHandler(sys.stderr)
 _stderr_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+_stderr_handler.addFilter(_pii_filter)
 log.addHandler(_stderr_handler)
 
 _file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _file_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 )
+_file_handler.addFilter(_pii_filter)
 log.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
@@ -124,6 +163,15 @@ class PermissionVerdict(BaseModel):
 # Regex for parsing permission verdicts from Signal messages: "y abcde" or "n abcde"
 VERDICT_PATTERN = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$", re.IGNORECASE)
 
+# Attachment ID format observed from signal-cli-rest-api: alphanumeric mixed-case
+# with dots, underscores, and hyphens (e.g. "hj0OJjrh74jPo7rVNMdr.jpg").
+# Blocks path separators (/ \) to prevent URL injection.
+_ATTACHMENT_ID_RE = re.compile(r'^[a-zA-Z0-9._-]{1,200}$')
+
+# Default directory for downloaded attachments. Set SIGNAL_ATTACHMENT_DIR to override.
+ATTACHMENT_DIR = Path(
+    os.environ.get("SIGNAL_ATTACHMENT_DIR", str(Path(tempfile.gettempdir()) / "signal-attachments"))
+)
 
 # ---------------------------------------------------------------------------
 # Build send payload helper
@@ -139,6 +187,21 @@ def _send_payload(cfg: dict, message: str, attachments: list[str] | None = None)
     if attachments:
         payload["base64_attachments"] = attachments
     return payload
+
+
+def _safe_raise_for_status(resp: httpx.Response) -> None:
+    """Raise HTTPStatusError on non-2xx responses without exposing the request URL.
+
+    Standard httpx HTTPStatusError messages include the full request URL, which
+    may contain the bot's phone number. This helper replaces that with a
+    status-code-only message.
+    """
+    if resp.is_error:
+        raise httpx.HTTPStatusError(
+            f"Signal API error: HTTP {resp.status_code}",
+            request=resp.request,
+            response=resp,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +233,8 @@ async def _get_config() -> dict:
 async def _get_client() -> httpx.AsyncClient:
     global _http
     if _http is None:
-        _http = httpx.AsyncClient(timeout=30)
+        timeout = float(os.environ.get("SIGNAL_API_TIMEOUT", "30"))
+        _http = httpx.AsyncClient(timeout=timeout)
     return _http
 
 
@@ -185,7 +249,7 @@ async def reply(message: str) -> str:
     client = await _get_client()
     payload = _send_payload(cfg, message)
     resp = await client.post(f"{cfg['api_url']}/v2/send", json=payload)
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     return f"Message sent (timestamp: {resp.json().get('timestamp', 'unknown')})"
 
 
@@ -231,7 +295,7 @@ async def send_attachment(file_path: str, message: str = "") -> str:
     client = await _get_client()
     payload = _send_payload(cfg, message, attachments=[b64])
     resp = await client.post(f"{cfg['api_url']}/v2/send", json=payload)
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     return f"Attachment sent: {path.name} (timestamp: {resp.json().get('timestamp', 'unknown')})"
 
 
@@ -241,21 +305,45 @@ async def send_attachment(file_path: str, message: str = "") -> str:
 
 @mcp.tool()
 async def download_attachment(attachment_id: str, save_path: str = "") -> str:
-    """Download an attachment from a received message to local disk."""
+    """Download an attachment from a received message to local disk.
+
+    Files are saved to ATTACHMENT_DIR (default: system temp dir /
+    signal-attachments). If save_path is provided it must resolve to a path
+    within ATTACHMENT_DIR -- paths outside that directory are rejected to
+    prevent traversal attacks.
+    """
+    if not _ATTACHMENT_ID_RE.match(attachment_id):
+        log.warning("Rejected invalid attachment_id format")
+        return "Error: invalid attachment_id format"
+
     cfg = await _get_config()
     client = await _get_client()
 
-    resp = await client.get(f"{cfg['api_url']}/v1/attachments/{attachment_id}")
-    resp.raise_for_status()
+    try:
+        resp = await client.get(f"{cfg['api_url']}/v1/attachments/{attachment_id}")
+        _safe_raise_for_status(resp)
+    except httpx.TimeoutException:
+        log.warning("Timed out fetching attachment")
+        return "Error: request timed out"
+    except httpx.HTTPStatusError as e:
+        log.warning("API error fetching attachment: HTTP %s", e.response.status_code)
+        return f"Error: Signal API returned {e.response.status_code}"
 
-    if not save_path:
-        save_dir = Path(tempfile.gettempdir()) / "signal-attachments"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = str(save_dir / attachment_id)
+    safe_dir = ATTACHMENT_DIR.resolve()
+    safe_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(save_path).write_bytes(resp.content)
-    return f"Attachment saved to {save_path} ({len(resp.content)} bytes)"
+    if save_path:
+        resolved = Path(save_path).resolve()
+        if not resolved.is_relative_to(safe_dir):
+            log.warning("Rejected save_path outside attachment directory")
+            return f"Error: save_path must be within {safe_dir}"
+        final_path = resolved
+    else:
+        final_path = safe_dir / attachment_id
+
+    final_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    final_path.write_bytes(resp.content)
+    return f"Attachment saved to {final_path} ({len(resp.content)} bytes)"
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +367,7 @@ async def react(emoji: str, target_sender: str, target_timestamp: int) -> str:
         f"{cfg['api_url']}/v1/reactions/{cfg['bot_number']}",
         json=payload,
     )
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     return f"Reacted with {emoji}"
 
 
@@ -298,7 +386,7 @@ async def send_typing(typing: bool = True) -> str:
         f"{cfg['api_url']}/v1/typing-indicator/{cfg['bot_number']}",
         json=payload,
     )
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     action = "started" if typing else "stopped"
     return f"Typing indicator {action}"
 
@@ -314,7 +402,7 @@ async def list_groups() -> str:
     client = await _get_client()
 
     resp = await client.get(f"{cfg['api_url']}/v1/groups/{cfg['bot_number']}")
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     groups = resp.json()
 
     if not groups:
@@ -340,7 +428,7 @@ async def get_contacts() -> str:
     client = await _get_client()
 
     resp = await client.get(f"{cfg['api_url']}/v1/contacts/{cfg['bot_number']}")
-    resp.raise_for_status()
+    _safe_raise_for_status(resp)
     contacts = resp.json()
 
     if not contacts:
@@ -403,6 +491,7 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                     try:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
+                        log.warning("Dropped malformed WebSocket message")
                         continue
 
                     envelope = msg.get("envelope", {})
@@ -533,7 +622,8 @@ async def run_channel_server() -> None:
         )
 
         async with AsyncExitStack() as stack:
-            _http = await stack.enter_async_context(httpx.AsyncClient(timeout=30))
+            timeout = float(os.environ.get("SIGNAL_API_TIMEOUT", "30"))
+            _http = await stack.enter_async_context(httpx.AsyncClient(timeout=timeout))
             perm_http = await stack.enter_async_context(
                 httpx.AsyncClient(timeout=10)
             )
