@@ -508,7 +508,7 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                         continue
 
                     envelope = msg.get("envelope", {})
-                    source = envelope.get("sourceNumber", "")
+                    source = envelope.get("sourceNumber") or envelope.get("sourceUuid") or ""
                     data = envelope.get("dataMessage", {})
                     body = data.get("message", "") or ""
                     mentions = data.get("mentions", [])
