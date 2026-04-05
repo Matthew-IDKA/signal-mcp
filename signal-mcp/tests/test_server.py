@@ -470,3 +470,56 @@ class TestPermissionRelay:
         assert dumped["method"] == "notifications/claude/channel/permission"
         assert dumped["params"]["request_id"] == "abcde"
         assert dumped["params"]["behavior"] == "allow"
+
+
+# ---------------------------------------------------------------------------
+# Group ID normalization tests
+# ---------------------------------------------------------------------------
+
+class TestGroupIdNormalization:
+    """The REST API returns group IDs as "group." + base64(base64(masterKey)).
+    The WebSocket delivers groupInfo.groupId as base64(masterKey) only.
+    _load_config() must normalize channel_id_ws for inbound routing while
+    preserving the original channel_id for outbound payloads.
+    """
+
+    def test_dm_channel_id_ws_unchanged(self, dm_env):
+        cfg = server._load_config()
+        assert cfg["channel_id"] == "+15559876543"
+        assert cfg["channel_id_ws"] == "+15559876543"
+
+    def test_group_channel_id_preserved_for_outbound(self, monkeypatch):
+        import base64
+        inner = "IVbVK5bnMUS8jRKvYBXjzZKTf7RG9URlhDJFIp5ZUV4="
+        outer = base64.b64encode(inner.encode("ascii")).decode("ascii")
+        rest_api_id = f"group.{outer}"
+        for k, v in ENV_DM.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("SIGNAL_CHANNEL_TYPE", "group")
+        monkeypatch.setenv("SIGNAL_CHANNEL_ID", rest_api_id)
+        cfg = server._load_config()
+        assert cfg["channel_id"] == rest_api_id  # outbound preserved
+
+    def test_group_channel_id_ws_decoded(self, monkeypatch):
+        import base64
+        inner = "IVbVK5bnMUS8jRKvYBXjzZKTf7RG9URlhDJFIp5ZUV4="
+        outer = base64.b64encode(inner.encode("ascii")).decode("ascii")
+        rest_api_id = f"group.{outer}"
+        for k, v in ENV_DM.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("SIGNAL_CHANNEL_TYPE", "group")
+        monkeypatch.setenv("SIGNAL_CHANNEL_ID", rest_api_id)
+        cfg = server._load_config()
+        assert cfg["channel_id_ws"] == inner  # WebSocket-comparable form
+
+    def test_group_channel_id_ws_matches_ws_envelope(self, monkeypatch):
+        """Simulates the real Emily-group IDs from production."""
+        # Actual values observed in signal-mcp.log
+        ws_group_id = "IVbVK5bnMUS8jRKvYBXjzZKTf7RG9URlhDJFIp5ZUV4="
+        rest_api_id = "group.SVZiVks1Ym5NVVM4alJLdllCWGp6WktUZjdSRzlVUmxoREpGSXA1WlVWND0="
+        for k, v in ENV_DM.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("SIGNAL_CHANNEL_TYPE", "group")
+        monkeypatch.setenv("SIGNAL_CHANNEL_ID", rest_api_id)
+        cfg = server._load_config()
+        assert cfg["channel_id_ws"] == ws_group_id

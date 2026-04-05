@@ -105,11 +105,24 @@ def _load_config() -> dict:
     approvers_raw = os.environ.get("SIGNAL_APPROVAL_SENDERS", "")
     approvers = [s.strip() for s in approvers_raw.split(",") if s.strip()]
 
+    # The REST API returns group IDs as "group." + base64(base64(masterKey)).
+    # The WebSocket delivers groupInfo.groupId as just base64(masterKey) — no
+    # prefix, one fewer layer of encoding. Compute a normalized form for inbound
+    # routing comparisons; keep the original for outbound (reply/react payloads).
+    raw_channel_id = os.environ["SIGNAL_CHANNEL_ID"]
+    channel_id_ws = raw_channel_id
+    if raw_channel_id.startswith("group."):
+        try:
+            channel_id_ws = base64.b64decode(raw_channel_id[6:]).decode("ascii").strip()
+        except Exception:
+            log.warning("Could not normalize group channel_id for WebSocket comparison")
+
     return {
         "api_url": os.environ["SIGNAL_API_URL"].rstrip("/"),
         "bot_number": os.environ["SIGNAL_BOT_NUMBER"],
         "channel_type": os.environ["SIGNAL_CHANNEL_TYPE"],
-        "channel_id": os.environ["SIGNAL_CHANNEL_ID"],
+        "channel_id": raw_channel_id,
+        "channel_id_ws": channel_id_ws,
         "allowed_senders": allowed,
         "approval_senders": approvers,
         "poll_interval": int(os.environ.get("SIGNAL_POLL_INTERVAL", "2")),
@@ -508,10 +521,10 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                     group_info = data.get("groupInfo", {})
                     message_group_id = group_info.get("groupId", "")
                     if cfg["channel_type"] == "group":
-                        if message_group_id != cfg["channel_id"]:
+                        if message_group_id != cfg["channel_id_ws"]:
                             log.debug(
                                 "Skipping message from unmatched group (got %r, want %r)",
-                                message_group_id, cfg["channel_id"],
+                                message_group_id, cfg["channel_id_ws"],
                             )
                             continue
                     elif cfg["channel_type"] == "dm":
