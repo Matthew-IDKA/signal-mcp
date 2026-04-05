@@ -109,7 +109,9 @@ signal-sandbox/
     .mcp.json        # SIGNAL_CHANNEL_TYPE=group, SIGNAL_CHANNEL_ID=group.<id>
 ```
 
-Each session is isolated: it only processes messages from allowed senders and always replies to its own configured channel. Launch each session with a channel-specific script (`cd` to the appropriate subdirectory before starting Claude Code).
+**signal-cli-rest-api broadcasts every inbound message to all connected WebSocket clients.** With multiple sessions running simultaneously, every session would receive every message without explicit filtering. signal-mcp handles this by checking `dataMessage.groupInfo.groupId` on each inbound envelope: group sessions discard any message whose group ID doesn't match `SIGNAL_CHANNEL_ID`; DM sessions discard any message that carries a group ID or arrives from a number other than `SIGNAL_CHANNEL_ID`. The result is true per-channel isolation — each session sees and replies to only its own channel's traffic, even when multiple sessions share the same bot number.
+
+Launch each session with a channel-specific script (`cd` to the appropriate subdirectory before starting Claude Code).
 
 ### Roadmap: dynamic routing (Option A)
 
