@@ -501,6 +501,27 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                     mentions = data.get("mentions", [])
                     raw_attachments = data.get("attachments", [])
 
+                    # Channel routing: only process messages for this session's
+                    # configured channel. signal-cli-rest-api broadcasts all
+                    # inbound messages to every connected WebSocket; filtering
+                    # here ensures each session only acts on its own channel.
+                    group_info = data.get("groupInfo", {})
+                    message_group_id = group_info.get("groupId", "")
+                    if cfg["channel_type"] == "group":
+                        if message_group_id != cfg["channel_id"]:
+                            log.debug(
+                                "Skipping message from unmatched group (got %r, want %r)",
+                                message_group_id, cfg["channel_id"],
+                            )
+                            continue
+                    elif cfg["channel_type"] == "dm":
+                        if message_group_id:
+                            log.debug("Skipping group message in DM session")
+                            continue
+                        if source != cfg["channel_id"]:
+                            log.debug("Skipping DM from unconfigured sender %s", source)
+                            continue
+
                     # Resolve @mention placeholders (U+FFFC) using mention metadata
                     if mentions and body:
                         chars = list(body)
