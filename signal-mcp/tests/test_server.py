@@ -746,3 +746,170 @@ class TestLogDirPermissions:
         from pathlib import Path
         expected = Path(tempfile.gettempdir())
         assert server.LOG_PATH.parent == expected
+
+
+# ---------------------------------------------------------------------------
+# Content validation -- Tier 5
+# ---------------------------------------------------------------------------
+
+class TestValidateBody:
+    def test_body_at_limit_passes(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_MAX_BODY_LENGTH", "4000")
+        body = "x" * 4000
+        result, reason = server._validate_body(body)
+        assert result == body
+        assert reason == ""
+
+    def test_body_over_limit_drops(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_MAX_BODY_LENGTH", "4000")
+        body = "x" * 4001
+        result, reason = server._validate_body(body)
+        assert result is None
+        assert "4001" in reason
+
+    def test_body_custom_limit(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_MAX_BODY_LENGTH", "10")
+        result, _ = server._validate_body("x" * 11)
+        assert result is None
+
+    def test_control_chars_stripped(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.delenv("SIGNAL_STRICT_UNICODE", raising=False)
+        body = "hello\x01world\x0b!"
+        result, reason = server._validate_body(body)
+        assert result == "helloworld!"
+        assert reason == ""
+
+    def test_tab_newline_preserved(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.delenv("SIGNAL_STRICT_UNICODE", raising=False)
+        body = "line1\nline2\ttabbed"
+        result, _ = server._validate_body(body)
+        assert result == body
+
+    def test_null_byte_stripped(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.delenv("SIGNAL_STRICT_UNICODE", raising=False)
+        result, _ = server._validate_body("hello\x00world")
+        assert result == "helloworld"
+
+    def test_body_empty_after_strip_drops(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.delenv("SIGNAL_STRICT_UNICODE", raising=False)
+        result, reason = server._validate_body("\x01\x02\x03")
+        assert result is None
+        assert "empty" in reason
+
+    def test_strict_unicode_drops_format_char(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.setenv("SIGNAL_STRICT_UNICODE", "1")
+        # U+00AD SOFT HYPHEN is category Cf
+        result, reason = server._validate_body("hello\u00adworld")
+        assert result is None
+        assert "Cf" in reason
+
+    def test_strict_unicode_off_allows_format_char(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_MAX_BODY_LENGTH", raising=False)
+        monkeypatch.setenv("SIGNAL_STRICT_UNICODE", "0")
+        result, _ = server._validate_body("hello\u00adworld")
+        assert result is not None
+
+
+class TestSanitizeAttachment:
+    def test_valid_attachment(self):
+        att = {"id": "abc123", "contentType": "image/jpeg", "filename": "photo.jpg", "size": 1024}
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert result["id"] == "abc123"
+        assert result["contentType"] == "image/jpeg"
+        assert result["filename"] == "photo.jpg"
+        assert result["size"] == 1024
+
+    def test_invalid_att_id_drops(self):
+        att = {"id": "../etc/passwd", "contentType": "image/jpeg", "filename": "x.jpg", "size": 1}
+        result = server._sanitize_attachment(att)
+        assert result is None
+
+    def test_empty_att_id_drops(self):
+        att = {"id": "", "contentType": "image/jpeg", "filename": "x.jpg", "size": 1}
+        result = server._sanitize_attachment(att)
+        assert result is None
+
+    def test_mime_type_normalized(self):
+        att = {"id": "abc123", "contentType": "not-a-mime", "filename": "x.bin", "size": 1}
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert result["contentType"] == "application/octet-stream"
+
+    def test_filename_path_traversal_sanitized(self):
+        att = {
+            "id": "abc123", "contentType": "text/plain",
+            "filename": "../../../etc/passwd", "size": 1,
+        }
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert "/" not in result["filename"]
+        assert "\\" not in result["filename"]
+
+    def test_filename_leading_dot_stripped(self):
+        att = {"id": "abc123", "contentType": "text/plain", "filename": ".bashrc", "size": 1}
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert not result["filename"].startswith(".")
+
+    def test_nonint_size_replaced(self):
+        att = {"id": "abc123", "contentType": "text/plain", "filename": "x.txt", "size": "large"}
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert result["size"] == ""
+
+    def test_absent_size_is_empty_string(self):
+        att = {"id": "abc123", "contentType": "text/plain", "filename": "x.txt"}
+        result = server._sanitize_attachment(att)
+        assert result is not None
+        assert result["size"] == ""
+
+
+class TestResolveMentions:
+    def test_basic_mention_resolved(self):
+        body = "hello \ufffc!"
+        mentions = [{"start": 6, "length": 1, "name": "Alice"}]
+        result = server._resolve_mentions(body, mentions)
+        assert result == "hello @Alice!"
+
+    def test_non_list_mentions_passthrough(self):
+        body = "hello world"
+        result = server._resolve_mentions(body, "not-a-list")
+        assert result == body
+
+    def test_oob_start_skipped(self):
+        body = "hi"
+        mentions = [{"start": 99, "length": 1, "name": "Alice"}]
+        result = server._resolve_mentions(body, mentions)
+        assert result == body
+
+    def test_negative_start_skipped(self):
+        body = "hello"
+        mentions = [{"start": -1, "length": 1, "name": "Alice"}]
+        result = server._resolve_mentions(body, mentions)
+        assert result == body
+
+    def test_oversized_length_clamped(self):
+        body = "abc"
+        mentions = [{"start": 1, "length": 100, "name": "X"}]
+        result = server._resolve_mentions(body, mentions)
+        # Should replace chars 1-2 ("bc") with "@X"
+        assert result == "a@X"
+
+    def test_name_capped_at_64(self):
+        body = "x\ufffc"
+        long_name = "A" * 100
+        mentions = [{"start": 1, "length": 1, "name": long_name}]
+        result = server._resolve_mentions(body, mentions)
+        assert len(result) == 1 + 1 + 64  # "x" + "@" + 64 chars
+
+    def test_non_int_start_skipped(self):
+        body = "hello"
+        mentions = [{"start": "bad", "length": 1, "name": "Alice"}]
+        result = server._resolve_mentions(body, mentions)
+        assert result == body

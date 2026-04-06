@@ -39,6 +39,11 @@ from pydantic import BaseModel
 
 _PII_PHONE_RE = re.compile(r'\+\d{7,15}')
 
+# Content validation regexes (Tier 5)
+_CONTROL_STRIP_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')  # preserve \t \n \r
+_ATT_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
+_MIME_RE = re.compile(r'^\w+/[\w.+\-]+$')
+
 
 def _redact_pii(text: str) -> str:
     """Replace E.164 phone numbers with a short non-reversible hash."""
@@ -250,6 +255,106 @@ def _load_env_file(path: str) -> None:
                 count += 1
 
     log.info("Loaded %d variable(s) from SIGNAL_ENV_FILE %s", count, path)
+
+
+# ---------------------------------------------------------------------------
+# Inbound content validation helpers (Tier 5)
+# ---------------------------------------------------------------------------
+
+def _validate_body(body: str) -> tuple[str | None, str]:
+    """Validate and sanitize an inbound message body.
+
+    Returns (cleaned_body, "") on success, or (None, reason) to drop the message.
+
+    Rules:
+      B1 -- Length cap: configurable via SIGNAL_MAX_BODY_LENGTH (default 4000).
+      B2 -- Control char stripping: C0 control chars stripped; \\t, \\n, \\r preserved.
+            If the body is empty after stripping, the message is dropped.
+      B3 -- Strict Unicode (opt-in, SIGNAL_STRICT_UNICODE=1): rejects bodies
+            containing Unicode format (Cf), other-control (Cc), or surrogate (Cs)
+            characters. Off by default to avoid false positives on emoji.
+    """
+    max_len = int(os.environ.get("SIGNAL_MAX_BODY_LENGTH", "4000"))
+    if len(body) > max_len:
+        return None, f"body length {len(body)} exceeds limit {max_len}"
+
+    cleaned = _CONTROL_STRIP_RE.sub("", body)
+
+    if os.environ.get("SIGNAL_STRICT_UNICODE") == "1":
+        import unicodedata
+        bad_cats = {"Cf", "Cc", "Cs"}
+        bad = {unicodedata.category(c) for c in cleaned if unicodedata.category(c) in bad_cats}
+        if bad:
+            return None, f"body contains disallowed Unicode categories: {bad}"
+
+    if not cleaned.strip():
+        return None, "body empty after sanitization"
+
+    return cleaned, ""
+
+
+def _sanitize_attachment(att: dict) -> dict | None:
+    """Validate and sanitize attachment metadata from an inbound message.
+
+    Returns a sanitized dict on success, or None to skip the attachment.
+
+    Rules:
+      - id: must match [a-zA-Z0-9_-]{1,64}; drop attachment if invalid.
+      - contentType: must match a MIME pattern; replace with application/octet-stream.
+      - filename: strip path separators and leading dots; cap at 128 chars.
+      - size: must be an integer or absent; replace with "" if unparseable.
+    """
+    att_id = str(att.get("id", ""))
+    if not _ATT_ID_RE.match(att_id):
+        log.warning("Dropping attachment with invalid id: %r", att_id[:32])
+        return None
+
+    ct = str(att.get("contentType", ""))
+    if not _MIME_RE.match(ct[:80]):
+        ct = "application/octet-stream"
+
+    fname = str(att.get("filename", ""))
+    fname = re.sub(r'[/\\]', '_', fname)
+    fname = fname.lstrip(".")
+    fname = fname[:128]
+
+    size = att.get("size", "")
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = ""
+
+    return {"id": att_id, "contentType": ct, "filename": fname, "size": size}
+
+
+def _resolve_mentions(body: str, mentions: list) -> str:
+    """Resolve @mention placeholders (U+FFFC) with bounds-checked metadata.
+
+    Replaces each placeholder using the mention's start/length offsets and
+    name field. Skips mentions with out-of-bounds or non-integer offsets.
+    Clamps oversized lengths to the remaining body length. Caps name at 64 chars.
+
+    If mentions is not a list, returns body unchanged.
+    """
+    if not isinstance(mentions, list) or not body:
+        return body
+    chars = list(body)
+    n = len(chars)
+    for m in sorted(
+        mentions,
+        key=lambda x: x.get("start", 0) if isinstance(x.get("start"), int) else 0,
+        reverse=True,
+    ):
+        start = m.get("start")
+        length = m.get("length")
+        if not isinstance(start, int) or not isinstance(length, int):
+            continue
+        if start < 0 or start >= n:
+            continue
+        length = max(1, min(length, n - start))
+        name = str(m.get("name") or m.get("number") or "unknown")[:64]
+        chars[start:start + length] = list(f"@{name}")
+    return "".join(chars)
 
 
 async def _check_signal_api(client: httpx.AsyncClient, api_url: str) -> None:
@@ -681,24 +786,18 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
 
                     # Resolve @mention placeholders (U+FFFC) using mention metadata
                     if mentions and body:
-                        chars = list(body)
-                        for m in sorted(mentions, key=lambda x: x.get("start", 0), reverse=True):
-                            start = m.get("start", 0)
-                            length = m.get("length", 1)
-                            name = m.get("name") or m.get("number", "unknown")
-                            chars[start:start + length] = list(f"@{name}")
-                        body = "".join(chars)
+                        body = _resolve_mentions(body, mentions)
 
                     # Surface inbound attachment metadata so Claude can download them
                     if raw_attachments:
                         att_lines = []
                         for att in raw_attachments:
-                            att_id = att.get("id", "")
-                            ct = att.get("contentType", "")
-                            fname = att.get("filename", "")
-                            size = att.get("size", "")
+                            sanitized = _sanitize_attachment(att)
+                            if sanitized is None:
+                                continue
                             att_lines.append(
-                                f"[attachment id={att_id} type={ct} name={fname} size={size}]"
+                                f"[attachment id={sanitized['id']} type={sanitized['contentType']}"
+                                f" name={sanitized['filename']} size={sanitized['size']}]"
                             )
                         att_text = "\n".join(att_lines)
                         body = f"{body}\n{att_text}".strip() if body else att_text
@@ -716,6 +815,12 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                     # Per-sender rate limit -- prevents message floods
                     if not _inbound_limiter.is_allowed(source):
                         log.warning("Rate-limited inbound message from %s", source)
+                        continue
+
+                    # Content validation -- length cap, control char sanitization
+                    body, reason = _validate_body(body)
+                    if body is None:
+                        log.warning("Dropped message content validation failed: %s", reason)
                         continue
 
                     # Check if this is a permission verdict (e.g., "y abcde")
