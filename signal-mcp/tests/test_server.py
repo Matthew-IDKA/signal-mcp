@@ -1,6 +1,7 @@
 """Tests for the Signal MCP server."""
 
 import logging
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ def reset_globals():
     """Reset module-level state between tests."""
     server._config = None
     server._http = None
+    server._pending_approvals.clear()
     yield
     if server._http:
         pass  # httpx.AsyncClient cleanup handled by test
@@ -523,3 +525,73 @@ class TestGroupIdNormalization:
         monkeypatch.setenv("SIGNAL_CHANNEL_ID", rest_api_id)
         cfg = server._load_config()
         assert cfg["channel_id_ws"] == ws_group_id
+
+
+# ---------------------------------------------------------------------------
+# HTTPS enforcement tests
+# ---------------------------------------------------------------------------
+
+class TestHttpsEnforcement:
+    def test_http_url_logs_warning(self, dm_env, caplog):
+        with caplog.at_level(logging.WARNING, logger="signal-mcp"):
+            server._load_config()
+        assert any("http://" in r.message and "cleartext" in r.message for r in caplog.records)
+
+    def test_https_url_no_warning(self, monkeypatch, caplog):
+        for k, v in ENV_DM.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("SIGNAL_API_URL", "https://signal-test:8093")
+        with caplog.at_level(logging.WARNING, logger="signal-mcp"):
+            server._load_config()
+        assert not any("cleartext" in r.message for r in caplog.records)
+
+    def test_allow_http_suppresses_warning(self, dm_env, monkeypatch, caplog):
+        monkeypatch.setenv("SIGNAL_ALLOW_HTTP", "1")
+        with caplog.at_level(logging.WARNING, logger="signal-mcp"):
+            server._load_config()
+        assert not any("cleartext" in r.message for r in caplog.records)
+
+    def test_api_url_preserved_in_config(self, dm_env):
+        cfg = server._load_config()
+        assert cfg["api_url"] == "http://signal-test:8093"
+
+
+# ---------------------------------------------------------------------------
+# Approval expiry tests
+# ---------------------------------------------------------------------------
+
+class TestApprovalExpiry:
+    def test_valid_verdict_accepted(self):
+        server._pending_approvals["abcde"] = time.monotonic()
+        status, msg = server._validate_verdict("abcde", ttl=300)
+        assert status == "ok"
+        assert msg is None
+        assert "abcde" not in server._pending_approvals  # consumed
+
+    def test_unknown_request_id_rejected(self):
+        status, msg = server._validate_verdict("zzzzz", ttl=300)
+        assert status == "unknown"
+        assert "zzzzz" in msg
+
+    def test_expired_verdict_rejected(self):
+        server._pending_approvals["abcde"] = time.monotonic() - 301
+        status, msg = server._validate_verdict("abcde", ttl=300)
+        assert status == "expired"
+        assert "abcde" in msg
+        assert "abcde" not in server._pending_approvals  # consumed even when expired
+
+    def test_double_reply_rejected(self):
+        server._pending_approvals["abcde"] = time.monotonic()
+        server._validate_verdict("abcde", ttl=300)  # first: consumed
+        status, _ = server._validate_verdict("abcde", ttl=300)  # second: unknown
+        assert status == "unknown"
+
+    def test_custom_ttl_respected(self):
+        server._pending_approvals["abcde"] = time.monotonic() - 11
+        status, _ = server._validate_verdict("abcde", ttl=10)
+        assert status == "expired"
+
+    def test_within_custom_ttl_accepted(self):
+        server._pending_approvals["abcde"] = time.monotonic() - 5
+        status, _ = server._validate_verdict("abcde", ttl=10)
+        assert status == "ok"
