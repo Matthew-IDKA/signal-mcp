@@ -7,6 +7,7 @@ outbound communication.
 """
 
 import base64
+import collections
 import hashlib
 import logging
 import os
@@ -61,7 +62,34 @@ class _PiiFilter(logging.Filter):
         return True
 
 
+class _SlidingWindowRateLimiter:
+    """Per-key sliding-window rate limiter.
+
+    Non-blocking: `is_allowed` returns False when the per-key call count
+    within `window_seconds` would exceed `max_calls`. Each key maintains
+    an independent deque of timestamps; entries older than the window are
+    evicted on each call so memory stays proportional to the call rate.
+    """
+
+    def __init__(self, max_calls: int, window_seconds: float) -> None:
+        self._max = max_calls
+        self._window = window_seconds
+        self._windows: dict[str, collections.deque] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        dq = self._windows.setdefault(key, collections.deque())
+        while dq and dq[0] < now - self._window:
+            dq.popleft()
+        if len(dq) >= self._max:
+            return False
+        dq.append(now)
+        return True
+
+
 _log_dir = Path(os.environ.get("SIGNAL_LOG_DIR", tempfile.gettempdir()))
+if "SIGNAL_LOG_DIR" in os.environ:
+    _log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 LOG_PATH = _log_dir / "signal-mcp.log"
 
 log = logging.getLogger("signal-mcp")
@@ -80,6 +108,23 @@ _file_handler.setFormatter(
 )
 _file_handler.addFilter(_pii_filter)
 log.addHandler(_file_handler)
+
+# ---------------------------------------------------------------------------
+# Rate limiters
+# ---------------------------------------------------------------------------
+# Inbound: per-sender, guards against message floods from a single contact.
+#   SIGNAL_INBOUND_MAX_CALLS (default 10) / SIGNAL_INBOUND_WINDOW_SECONDS (default 60)
+# Outbound notify: global, prevents notification storms (e.g., repeated rejections).
+#   SIGNAL_NOTIFY_MAX_CALLS (default 5) / SIGNAL_NOTIFY_WINDOW_SECONDS (default 10)
+
+_inbound_limiter = _SlidingWindowRateLimiter(
+    max_calls=int(os.environ.get("SIGNAL_INBOUND_MAX_CALLS", "10")),
+    window_seconds=float(os.environ.get("SIGNAL_INBOUND_WINDOW_SECONDS", "60")),
+)
+_notify_limiter = _SlidingWindowRateLimiter(
+    max_calls=int(os.environ.get("SIGNAL_NOTIFY_MAX_CALLS", "5")),
+    window_seconds=float(os.environ.get("SIGNAL_NOTIFY_WINDOW_SECONDS", "10")),
+)
 
 # ---------------------------------------------------------------------------
 # Configuration from environment
@@ -578,6 +623,9 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
 
     async def _notify(text: str) -> None:
         """Send a notice to the Signal channel (e.g., rejection messages)."""
+        if not _notify_limiter.is_allowed("_notify"):
+            log.warning("Outbound notify rate-limited, suppressing: %.80s", text)
+            return
         client = await _get_client()
         payload = _send_payload(cfg, text)
         await client.post(f"{cfg['api_url']}/v2/send", json=payload)
@@ -663,6 +711,11 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                     # Sender allowlist gate -- prevents prompt injection
                     if allowed and source not in allowed:
                         log.warning("Dropped message from unlisted sender %s", source)
+                        continue
+
+                    # Per-sender rate limit -- prevents message floods
+                    if not _inbound_limiter.is_allowed(source):
+                        log.warning("Rate-limited inbound message from %s", source)
                         continue
 
                     # Check if this is a permission verdict (e.g., "y abcde")

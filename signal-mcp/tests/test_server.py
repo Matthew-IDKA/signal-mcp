@@ -37,6 +37,8 @@ def reset_globals():
     server._config = None
     server._http = None
     server._pending_approvals.clear()
+    server._inbound_limiter._windows.clear()
+    server._notify_limiter._windows.clear()
     yield
     if server._http:
         pass  # httpx.AsyncClient cleanup handled by test
@@ -679,3 +681,68 @@ class TestEnvFile:
         with caplog.at_level(logging.WARNING, logger="signal-mcp"):
             server._load_env_file(str(env_file))
         assert any("group/others" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter unit tests
+# ---------------------------------------------------------------------------
+
+class TestSlidingWindowRateLimiter:
+    def test_allows_calls_within_limit(self):
+        rl = server._SlidingWindowRateLimiter(max_calls=3, window_seconds=60)
+        assert rl.is_allowed("k") is True
+        assert rl.is_allowed("k") is True
+        assert rl.is_allowed("k") is True
+
+    def test_blocks_when_limit_reached(self):
+        rl = server._SlidingWindowRateLimiter(max_calls=3, window_seconds=60)
+        for _ in range(3):
+            rl.is_allowed("k")
+        assert rl.is_allowed("k") is False
+
+    def test_independent_keys(self):
+        rl = server._SlidingWindowRateLimiter(max_calls=1, window_seconds=60)
+        assert rl.is_allowed("a") is True
+        assert rl.is_allowed("b") is True  # separate bucket
+        assert rl.is_allowed("a") is False  # a exhausted
+
+    def test_window_expiry_allows_again(self):
+        """Timestamps older than the window are evicted, freeing capacity."""
+        rl = server._SlidingWindowRateLimiter(max_calls=2, window_seconds=1)
+        rl.is_allowed("k")
+        rl.is_allowed("k")
+        # Manually backdate the timestamps to simulate window expiry
+        dq = rl._windows["k"]
+        for i in range(len(dq)):
+            dq[i] = dq[i] - 2  # 2 seconds ago, outside 1-second window
+        assert rl.is_allowed("k") is True
+
+    def test_zero_max_calls_always_blocks(self):
+        rl = server._SlidingWindowRateLimiter(max_calls=0, window_seconds=60)
+        assert rl.is_allowed("k") is False
+
+    def test_module_instances_exist(self):
+        assert hasattr(server, "_inbound_limiter")
+        assert hasattr(server, "_notify_limiter")
+        assert isinstance(server._inbound_limiter, server._SlidingWindowRateLimiter)
+        assert isinstance(server._notify_limiter, server._SlidingWindowRateLimiter)
+
+
+# ---------------------------------------------------------------------------
+# Log dir permission tests
+# ---------------------------------------------------------------------------
+
+class TestLogDirPermissions:
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix mkdir mode only")
+    def test_log_dir_created_with_restricted_permissions(self, tmp_path):
+        log_dir = tmp_path / "signal-logs"
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stat = log_dir.stat()
+        assert oct(stat.st_mode)[-3:] == "700"
+
+    def test_log_dir_defaults_to_tempdir(self, monkeypatch):
+        import tempfile
+        monkeypatch.delenv("SIGNAL_LOG_DIR", raising=False)
+        from pathlib import Path
+        expected = Path(tempfile.gettempdir())
+        assert server.LOG_PATH.parent == expected
