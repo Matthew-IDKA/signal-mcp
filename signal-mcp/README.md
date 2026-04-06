@@ -39,9 +39,15 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |---|---|---|
+| `SIGNAL_ENV_FILE` | *(not set)* | Path to a `KEY=VALUE` secrets file. Loaded before any other vars are read. Keeps phone numbers out of `.mcp.json`. On Unix, warns if file permissions are broader than `0600`. |
 | `SIGNAL_ALLOWED_SENDERS` | *(empty -- all senders)* | Comma-separated phone numbers. Only messages from these senders are forwarded to Claude Code. Recommended for security. |
 | `SIGNAL_APPROVAL_SENDERS` | *(empty -- disabled)* | Comma-separated phone numbers authorized to approve/deny tool permission requests via Signal. |
+| `SIGNAL_APPROVAL_TTL_SECONDS` | `300` | Seconds after which a pending permission verdict expires. Prevents stale or replayed approvals. |
+| `SIGNAL_API_TIMEOUT` | `30` | HTTP/WebSocket request timeout in seconds. |
 | `SIGNAL_POLL_INTERVAL` | `2` | Seconds between WebSocket reconnect attempts (used during backoff). |
+| `SIGNAL_LOG_DIR` | system temp | Directory for `signal-mcp.log`. Set to a user-owned path on multi-user hosts. |
+| `SIGNAL_ATTACHMENT_DIR` | system temp `/signal-attachments` | Directory for downloaded attachments. Created with `0700` permissions. |
+| `SIGNAL_ALLOW_HTTP` | *(not set)* | Set to any value to suppress the warning when `SIGNAL_API_URL` uses `http://` (cleartext). |
 
 ## Claude Code Integration
 
