@@ -94,7 +94,16 @@ REQUIRED_ENV = [
 
 
 def _load_config() -> dict:
-    """Load and validate configuration from environment variables."""
+    """Load and validate configuration from environment variables.
+
+    If SIGNAL_ENV_FILE is set, that file is read first and its KEY=VALUE
+    pairs are injected into the environment before any other vars are read.
+    Existing env vars take precedence over file values.
+    """
+    env_file = os.environ.get("SIGNAL_ENV_FILE")
+    if env_file:
+        _load_env_file(env_file)
+
     missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
     if missing:
         log.fatal("Missing required environment variables: %s", ", ".join(missing))
@@ -141,6 +150,61 @@ def _validate_channel_type(channel_type: str) -> None:
     if channel_type not in ("dm", "group"):
         log.fatal("SIGNAL_CHANNEL_TYPE must be 'dm' or 'group', got '%s'", channel_type)
         sys.exit(1)
+
+
+def _load_env_file(path: str) -> None:
+    """Load KEY=VALUE pairs from a secrets file into os.environ.
+
+    Existing env vars are NOT overwritten -- the process environment takes
+    precedence, so individual values can still be overridden in .mcp.json or
+    the shell without editing the secrets file.
+
+    Format:
+        # comment
+        KEY=value
+        KEY="value with spaces"
+        KEY='value'
+
+    On Unix, warns if the file has group/other read bits set.
+    On Windows, file-level ACL restrictions are the user's responsibility.
+    """
+    p = Path(path)
+    if not p.is_file():
+        log.fatal("SIGNAL_ENV_FILE not found: %s", path)
+        sys.exit(1)
+
+    if sys.platform != "win32":
+        mode = p.stat().st_mode
+        if mode & 0o077:
+            log.warning(
+                "SIGNAL_ENV_FILE %s is readable by group/others (mode %04o). "
+                "Restrict with: chmod 600 %s",
+                path,
+                mode & 0o777,
+                path,
+            )
+
+    count = 0
+    with p.open(encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" not in stripped:
+                log.warning("SIGNAL_ENV_FILE line %d: no '=' separator, skipping", lineno)
+                continue
+            key, _, raw_val = stripped.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            val = raw_val.strip()
+            if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
+                val = val[1:-1]
+            if key not in os.environ:
+                os.environ[key] = val
+                count += 1
+
+    log.info("Loaded %d variable(s) from SIGNAL_ENV_FILE %s", count, path)
 
 
 async def _check_signal_api(client: httpx.AsyncClient, api_url: str) -> None:

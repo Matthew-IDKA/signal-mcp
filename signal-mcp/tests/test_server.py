@@ -1,6 +1,8 @@
 """Tests for the Signal MCP server."""
 
 import logging
+import os
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -595,3 +597,85 @@ class TestApprovalExpiry:
         server._pending_approvals["abcde"] = time.monotonic() - 5
         status, _ = server._validate_verdict("abcde", ttl=10)
         assert status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Env file loader tests
+# ---------------------------------------------------------------------------
+
+class TestEnvFile:
+    def test_loads_vars_into_environ(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("SIGNAL_BOT_NUMBER=+15550009999\nSIGNAL_CHANNEL_ID=+15550001111\n")
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        monkeypatch.delenv("SIGNAL_CHANNEL_ID", raising=False)
+        server._load_env_file(str(env_file))
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550009999"
+        assert os.environ["SIGNAL_CHANNEL_ID"] == "+15550001111"
+
+    def test_existing_env_var_not_overwritten(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("SIGNAL_BOT_NUMBER=+15550009999\n")
+        monkeypatch.setenv("SIGNAL_BOT_NUMBER", "+15550001234")
+        server._load_env_file(str(env_file))
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550001234"
+
+    def test_comments_and_blank_lines_skipped(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("# this is a comment\n\nSIGNAL_BOT_NUMBER=+15550009999\n")
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        server._load_env_file(str(env_file))
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550009999"
+
+    def test_double_quoted_value(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text('SIGNAL_BOT_NUMBER="+15550009999"\n')
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        server._load_env_file(str(env_file))
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550009999"
+
+    def test_single_quoted_value(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("SIGNAL_BOT_NUMBER='+15550009999'\n")
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        server._load_env_file(str(env_file))
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550009999"
+
+    def test_missing_file_exits(self, tmp_path):
+        with pytest.raises(SystemExit):
+            server._load_env_file(str(tmp_path / "nonexistent.env"))
+
+    def test_invalid_line_logged_and_skipped(self, tmp_path, monkeypatch, caplog):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("NOTAVALIDLINE\nSIGNAL_BOT_NUMBER=+15550009999\n")
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        with caplog.at_level(logging.WARNING, logger="signal-mcp"):
+            server._load_env_file(str(env_file))
+        assert any("no '=' separator" in r.message for r in caplog.records)
+        assert os.environ["SIGNAL_BOT_NUMBER"] == "+15550009999"
+
+    def test_load_config_reads_env_file(self, tmp_path, monkeypatch):
+        """_load_config() invokes _load_env_file when SIGNAL_ENV_FILE is set."""
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text(
+            "SIGNAL_BOT_NUMBER=+15550009999\n"
+            "SIGNAL_CHANNEL_ID=+15559876543\n"
+        )
+        monkeypatch.setenv("SIGNAL_ENV_FILE", str(env_file))
+        monkeypatch.setenv("SIGNAL_API_URL", "https://signal-test:8093")
+        monkeypatch.setenv("SIGNAL_CHANNEL_TYPE", "dm")
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        monkeypatch.delenv("SIGNAL_CHANNEL_ID", raising=False)
+        cfg = server._load_config()
+        assert cfg["bot_number"] == "+15550009999"
+        assert cfg["channel_id"] == "+15559876543"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix file permissions only")
+    def test_world_readable_file_warns(self, tmp_path, monkeypatch, caplog):
+        env_file = tmp_path / ".signal-mcp.env"
+        env_file.write_text("SIGNAL_BOT_NUMBER=+15550009999\n")
+        env_file.chmod(0o644)
+        monkeypatch.delenv("SIGNAL_BOT_NUMBER", raising=False)
+        with caplog.at_level(logging.WARNING, logger="signal-mcp"):
+            server._load_env_file(str(env_file))
+        assert any("group/others" in r.message for r in caplog.records)
