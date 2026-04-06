@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -117,8 +118,15 @@ def _load_config() -> dict:
         except Exception:
             log.warning("Could not normalize group channel_id for WebSocket comparison")
 
+    api_url = os.environ["SIGNAL_API_URL"].rstrip("/")
+    if api_url.startswith("http://") and not os.environ.get("SIGNAL_ALLOW_HTTP"):
+        log.warning(
+            "SIGNAL_API_URL uses http:// -- credentials transmitted in cleartext. "
+            "Set SIGNAL_ALLOW_HTTP=1 to suppress."
+        )
+
     return {
-        "api_url": os.environ["SIGNAL_API_URL"].rstrip("/"),
+        "api_url": api_url,
         "bot_number": os.environ["SIGNAL_BOT_NUMBER"],
         "channel_type": os.environ["SIGNAL_CHANNEL_TYPE"],
         "channel_id": raw_channel_id,
@@ -233,6 +241,30 @@ mcp = FastMCP(
 # Lazy-initialized at first tool call
 _config: dict | None = None
 _http: httpx.AsyncClient | None = None
+_pending_approvals: dict[str, float] = {}  # request_id -> time.monotonic() when issued
+
+
+def _validate_verdict(request_id: str, ttl: float) -> tuple[str, str | None]:
+    """Validate and consume a pending permission verdict.
+
+    Returns:
+        ('ok', None)         -- request is known and within TTL; entry consumed
+        ('unknown', msg)     -- request_id not in registry (never issued or double-reply)
+        ('expired', msg)     -- request exists but TTL has elapsed; entry consumed
+    """
+    issued_at = _pending_approvals.pop(request_id, None)
+    if issued_at is None:
+        return (
+            "unknown",
+            f"Verdict rejected: unknown or already-processed request ID '{request_id}'.",
+        )
+    age = time.monotonic() - issued_at
+    if age > ttl:
+        return (
+            "expired",
+            f"Verdict rejected: request '{request_id}' expired ({age:.0f}s > {ttl:.0f}s TTL).",
+        )
+    return ("ok", None)
 
 
 async def _get_config() -> dict:
@@ -584,6 +616,17 @@ async def _poll_signal_messages(session: ServerSession, cfg: dict) -> None:
                             continue
                         answer = verdict_match.group(1).lower()
                         request_id = verdict_match.group(2)
+                        ttl = float(os.environ.get("SIGNAL_APPROVAL_TTL_SECONDS", "300"))
+                        status, error_msg = _validate_verdict(request_id, ttl)
+                        if status != "ok":
+                            log.warning(
+                                "Approval verdict rejected (%s): %s", status, request_id
+                            )
+                            try:
+                                await _notify(error_msg)
+                            except httpx.HTTPError:
+                                pass
+                            continue
                         behavior = "allow" if answer in ("y", "yes") else "deny"
                         verdict = PermissionVerdict(
                             params=PermissionVerdictParams(
@@ -680,6 +723,7 @@ async def run_channel_server() -> None:
                 payload = _send_payload(cfg, msg)
                 try:
                     await perm_http.post(f"{cfg['api_url']}/v2/send", json=payload)
+                    _pending_approvals[request_id] = time.monotonic()
                 except httpx.HTTPError as e:
                     log.warning("Failed to send permission request: %s", e)
 
