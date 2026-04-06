@@ -16,6 +16,7 @@ desktop.ini
 
 # Test artifacts
 .pytest_cache/
+pytest-cache-files-*/
 *.egg-info/
 dist/
 build/
