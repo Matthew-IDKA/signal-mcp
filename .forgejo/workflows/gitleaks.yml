@@ -1,0 +1,29 @@
+# gitleaks secret scan -- Forgejo CI enforcement tier (Vikunja #1264, ADR-062).
+#
+# CANONICAL SOURCE: tools/gitleaks/forgejo-workflow.yml
+# Installed into each Forgejo-hosted repo as .forgejo/workflows/gitleaks.yml
+# (by the git-onboard command and the F-gitleaks Phase C rollout).
+#
+# runs-on: python resolves to the local/ci-runner image, which carries the
+# gitleaks binary baked in per #1264 Phase C Stage 1.
+#
+# Baseline: a repo with pre-existing tree findings commits a redacted
+# .gitleaksbaseline.json (generated `gitleaks dir . --redact --report-path
+# .gitleaksbaseline.json`). The scan step auto-detects that file and passes
+# --baseline-path, so the repo does not red-CI before P3 remediation. No
+# baseline file -> a plain scan. One workflow file serves every repo.
+name: gitleaks
+on: [push]
+
+jobs:
+  scan:
+    runs-on: python
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks secret scan
+        run: |
+          if [ -f .gitleaksbaseline.json ]; then
+            gitleaks dir . --redact --no-banner --baseline-path .gitleaksbaseline.json
+          else
+            gitleaks dir . --redact --no-banner
+          fi
